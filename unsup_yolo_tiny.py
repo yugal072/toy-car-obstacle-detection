@@ -4,6 +4,8 @@ import numpy as np
 import time
 import argparse
 
+import tensorflow as tf
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--weights", default="yolov4-tiny.weights")
@@ -12,21 +14,18 @@ def parse_args():
     p.add_argument("--source", default=0, help="video source: 0 for webcam or path to video")
     p.add_argument("--input-size", type=int, default=416, help="network input size (320 or 416)")
     p.add_argument("--conf-thresh", type=float, default=0.4)
-    p.add_argument("--nms-thresh", type=float, default=0.4)
+    p.add_argument("--iou-thresh", type=float, default=0.45)
     p.add_argument("--min-area", type=int, default=900, help="min contour area for FG blobs")
     return p.parse_args()
 
-def load_yolo(cfg_path, weights_path):
-    net = cv2.dnn.readNetFromDarknet(cfg_path, weights_path)
-    # Use CPU by default; if you have OpenCV built with CUDA, you can set CUDA target
-    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-    ln = net.getLayerNames()
-    try:
-        out_layers = [ln[i - 1] for i in net.getUnconnectedOutLayers().flatten()]
-    except:
-        out_layers = [ln[i[0] - 1] for i in net.getUnconnectedOutLayers()]
-    return net, out_layers
+
+# loading yolo- tensorflow
+def load_yolo_tf(model_path):
+    model = tf.saved_model.load(model_path)
+    infer = model.signatures['serving_default']
+    return infer
+
+
 
 def iou(boxA, boxB):
     xA = max(boxA[0], boxB[0])
@@ -49,18 +48,20 @@ def main():
     with open(args.names) as f:
         classes = [c.strip() for c in f.readlines()]
 
-    net, out_names = load_yolo(args.cfg, args.weights)
-    print("YOLO loaded. Output layers:", out_names)
+    
+    infer = load_yolo_tf(args.weights)
+    print(" YoloV4-tiny Tensorflow model reloaded.")
 
-    cap = cv2.VideoCapture(int(args.source) if str(args.source).isdigit() else args.source)
+    cap = cv2.VideoCapture(int(args.source) if str(args.source).isdigit() else args.source)     # Video source
     fgbg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=25, detectShadows=True)
 
     input_size = args.input_size
     conf_thresh = args.conf_thresh
-    nms_thresh = args.nms_thresh
+    iou_thresh = args.iou_thresh
     min_area = args.min_area
 
     prev_time = time.time()
+    
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -68,43 +69,62 @@ def main():
         H, W = frame.shape[:2]
 
         # --- YOLO inference ---
-        blob = cv2.dnn.blobFromImage(frame, 1/255.0, (input_size, input_size), swapRB=True, crop=False)
-        net.setInput(blob)
-        layer_outputs = net.forward(out_names)
+        img_in = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img_in = cv2.resize(img_in, (input_size, input_size))
+        img_in = img_in / 255.0
+        img_in = img_in.astype(np.float32)
+        img_in = np.expand_dims(img_in, axis=0)        
+        
+        batch_data = tf.constant(img_in)
+        pred = infer(batch_data)  # dict of { 'tf_op_layer_concat': boxes, 'tf_op_layer_conf': scores }
 
-        boxes = []
-        confidences = []
-        classIDs = []
-        for output in layer_outputs:
-            for detection in output:
-                scores = detection[5:]
-                classID = int(np.argmax(scores))
-                confidence = float(scores[classID])
-                if confidence > conf_thresh:
-                    cx = int(detection[0] * W)
-                    cy = int(detection[1] * H)
-                    w = int(detection[2] * W)
-                    h = int(detection[3] * H)
-                    x = max(0, int(cx - w/2))
-                    y = max(0, int(cy - h/2))
-                    boxes.append([x, y, w, h])
-                    confidences.append(confidence)
-                    classIDs.append(classID)
-        # NMS
-        idxs = []
-        if len(boxes) > 0:
-            idxs = cv2.dnn.NMSBoxes(boxes, confidences, conf_thresh, nms_thresh)
-            idxs = idxs.flatten() if isinstance(idxs, (list, tuple, np.ndarray)) else [int(x) for x in idxs]
+        
+        # NOTE: keys depend on model export; common: 'tf_op_layer_concat', 'tf_op_layer_concat_1'
+        boxes = pred['tf_op_layer_concat'].numpy()    # shape: (1, N, 4)
+        confs = pred['tf_op_layer_concat_1'].numpy()  # shape: (1, N, num_classes)
 
-        yolo_detected_boxes = [boxes[i] for i in idxs] if len(idxs) > 0 else []
-        # draw YOLO boxes
+        boxes, confs = boxes[0], confs[0]
+
+        boxes_scaled, confidences, classIDs = [], [], []
+        
+        for i in range(len(boxes)):
+            box = boxes[i]
+            score = confs[i]
+            classID = int(np.argmax(score))
+            confidence = score[classID]
+            if confidence > conf_thresh:
+                # YOLO boxes are in normalized format (ymin, xmin, ymax, xmax)
+                ymin, xmin, ymax, xmax = box
+                x = int(xmin * W)
+                y = int(ymin * H)
+                w = int((xmax - xmin) * W)
+               
+                h = int((ymax - ymin) * H)
+                boxes_scaled.append([x, y, w, h])
+                confidences.append(float(confidence))
+                classIDs.append(classID)
+        
+        idxs = tf.image.non_max_suppression(
+            boxes=np.array([ [b[1], b[0], b[1]+b[3], b[0]+b[2]] for b in boxes_scaled ]),
+            scores=np.array(confidences),
+            max_output_size=50,
+            iou_threshold=iou_thresh,
+            score_threshold=conf_thresh
+        ).numpy()
+        
+        yolo_detected_boxes=[boxes_scaled[i] for i in idxs]
+        
+        #drawing yolo detection 
+        
         for i in idxs:
-            x,y,w,h = boxes[i]
+            x, y, w, h = boxes_scaled[i]
             label = f"{classes[classIDs[i]]}:{confidences[i]:.2f}"
-            cv2.rectangle(frame, (x,y), (x+w, y+h), (0,0,255), 2)
+            cv2.rectangle(frame, (x, y), (x+w, y+h), (0,0,255), 2)
             cv2.putText(frame, label, (x, y-6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,255), 2)
 
+        
         # --- Unsupervised: background subtraction (MOG2) ---
+        
         fgmask = fgbg.apply(frame)
         # shadows are 127 if detectShadows=True, remove them by thresholding
         _, fgmask = cv2.threshold(fgmask, 250, 255, cv2.THRESH_BINARY)
@@ -113,16 +133,19 @@ def main():
         fgmask = cv2.dilate(fgmask, kernel, iterations=2)
 
         contours, _ = cv2.findContours(fgmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
         for c in contours:
             if cv2.contourArea(c) < min_area:
                 continue
             x,y,w,h = cv2.boundingRect(c)
             candidate = [x,y,w,h]
             # check overlap vs YOLO detections. if overlap with a YOLO box, we consider it already handled
+            
             overlaps = [iou(candidate, yb) for yb in yolo_detected_boxes]
             if len(overlaps) > 0 and max(overlaps) > 0.3:
                 # it's probably the same object YOLO detected -> skip drawing 'unknown'
                 continue
+            
             # else mark as unknown obstacle
             cv2.rectangle(frame, (x,y), (x+w, y+h), (0,200,200), 2)
             cv2.putText(frame, "unknown_obstacle", (x, y-6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,200,200), 2)
@@ -133,8 +156,8 @@ def main():
         prev_time = cur_time
         cv2.putText(frame, f"FPS:{fps:.1f}", (10,20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
 
-        cv2.imshow("unsup-yolo", frame)
-        # optional: also show fgmask for debugging
+        cv2.imshow("unsup-yolo-tf", frame)
+        #  also show fgmask for debugging (optional)
         cv2.imshow("fgmask", fgmask)
 
         key = cv2.waitKey(1) & 0xFF
